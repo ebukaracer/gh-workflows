@@ -1,0 +1,390 @@
+name: Build UnityPackage
+
+on:
+  workflow_call:
+    inputs:
+      target_branch:
+        description: 'Branch containing the package source'
+        required: false
+        type: string
+        default: 'upm'
+
+      source_path:
+        description: 'Folder whose contents should be packaged'
+        required: true
+        type: string
+
+      unity_import_path:
+        description: 'Destination path inside the Unity project'
+        required: true
+        type: string
+
+      output_path:
+        description: 'Repository path where the .unitypackage should be saved'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------------------
+      # Checkout caller repository
+      # ------------------------------------------------------------
+
+      - name: Checkout package repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # Validate configuration
+      # ------------------------------------------------------------
+
+      - name: Validate configuration
+        env:
+          SOURCE_PATH: ${{ inputs.source_path }}
+          UNITY_IMPORT_PATH: ${{ inputs.unity_import_path }}
+          OUTPUT_PATH: ${{ inputs.output_path }}
+        run: |
+          if [ ! -d "$SOURCE_PATH" ]; then
+            echo "ERROR: Source directory does not exist:"
+            echo "$SOURCE_PATH"
+            exit 1
+          fi
+
+          case "$UNITY_IMPORT_PATH" in
+            Assets/*)
+              ;;
+            *)
+              echo "ERROR: unity_import_path must begin with Assets/"
+              echo "Received: $UNITY_IMPORT_PATH"
+              exit 1
+              ;;
+          esac
+
+          if [[ "$OUTPUT_PATH" != *.unitypackage ]]; then
+            echo "ERROR: output_path must end with .unitypackage"
+            exit 1
+          fi
+
+          echo "Source:"
+          echo "  $SOURCE_PATH"
+
+          echo "Unity destination:"
+          echo "  $UNITY_IMPORT_PATH"
+
+          echo "Package output:"
+          echo "  $OUTPUT_PATH"
+
+      # ------------------------------------------------------------
+      # Create temporary UnityPackage structure
+      #
+      # Example:
+      #
+      # source_path:
+      # Dependencies~/Elements
+      #
+      # unity_import_path:
+      # Assets/EzSaver/Elements
+      #
+      # becomes:
+      #
+      # PackageStaging/
+      # └── Assets/
+      #     └── EzSaver/
+      #         └── Elements/
+      # ------------------------------------------------------------
+
+      - name: Prepare UnityPackage staging directory
+        env:
+          SOURCE_PATH: ${{ inputs.source_path }}
+          UNITY_IMPORT_PATH: ${{ inputs.unity_import_path }}
+        run: |
+          rm -rf PackageStaging
+
+          mkdir -p \
+            "PackageStaging/$(dirname "$UNITY_IMPORT_PATH")"
+
+          cp -a \
+            "$SOURCE_PATH" \
+            "PackageStaging/$UNITY_IMPORT_PATH"
+
+          echo "Staging structure:"
+          find PackageStaging -print
+
+      # ------------------------------------------------------------
+      # Generate deterministic folder .meta files
+      #
+      # Example:
+      #
+      # Assets/EzUtilities/Extras/Runtime
+      #
+      # Generates:
+      #
+      # Assets/EzUtilities.meta
+      # Assets/EzUtilities/Extras.meta
+      # Assets/EzUtilities/Extras/Runtime.meta
+      #
+      # Assets.meta is intentionally NOT generated.
+      #
+      # GUIDs are generated deterministically using:
+      #
+      # repository + folder path
+      #
+      # This means the same folder in the same repository always
+      # receives the same GUID across every workflow run.
+      # ------------------------------------------------------------
+
+      - name: Generate folder meta files
+        env:
+          UNITY_IMPORT_PATH: ${{ inputs.unity_import_path }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 <<'PY'
+          import hashlib
+          import os
+
+          import_path = os.environ["UNITY_IMPORT_PATH"].strip("/")
+          repository = os.environ["REPOSITORY"]
+
+          if not import_path.startswith("Assets/"):
+              raise SystemExit(
+                  "unity_import_path must start with Assets/"
+              )
+
+          parts = import_path.split("/")
+
+          # Skip Assets itself.
+          #
+          # Example:
+          # Assets/EzUtilities/Extras/Runtime
+          #
+          # Generates:
+          # Assets/EzUtilities
+          # Assets/EzUtilities/Extras
+          # Assets/EzUtilities/Extras/Runtime
+
+          folders = []
+
+          for index in range(2, len(parts) + 1):
+              folder = "/".join(parts[:index])
+              folders.append(folder)
+
+          for folder in folders:
+              staging_folder = os.path.join(
+                  "PackageStaging",
+                  folder
+              )
+
+              if not os.path.isdir(staging_folder):
+                  raise SystemExit(
+                      f"Expected staging folder does not exist: "
+                      f"{staging_folder}"
+                  )
+
+              # Stable deterministic GUID.
+              #
+              # Same repository + same folder path
+              # = same GUID forever.
+              seed = f"{repository}:{folder}"
+
+              guid = hashlib.sha256(
+                  seed.encode("utf-8")
+              ).hexdigest()[:32]
+
+              meta_path = staging_folder + ".meta"
+
+              with open(meta_path, "w", newline="\n") as meta:
+                  meta.write(
+                      "fileFormatVersion: 2\n"
+                      f"guid: {guid}\n"
+                      "folderAsset: yes\n"
+                      "DefaultImporter:\n"
+                      "  externalObjects: {}\n"
+                      "  userData:\n"
+                      "  assetBundleName:\n"
+                      "  assetBundleVariant:\n"
+                  )
+
+              print(f"Created: {meta_path}")
+              print(f"GUID: {guid}")
+          PY
+
+      # ------------------------------------------------------------
+      # Generate list of Unity .meta files
+      # ------------------------------------------------------------
+
+      - name: Generate meta file list
+        env:
+          UNITY_IMPORT_PATH: ${{ inputs.unity_import_path }}
+        run: |
+          python3 <<'PY'
+          import os
+
+          import_path = os.environ["UNITY_IMPORT_PATH"].strip("/")
+          parts = import_path.split("/")
+
+          meta_files = set()
+
+          # --------------------------------------------------------
+          # Include generated destination-folder meta files.
+          #
+          # Assets itself is intentionally skipped.
+          # --------------------------------------------------------
+
+          for index in range(2, len(parts) + 1):
+              folder = "/".join(parts[:index])
+
+              meta_files.add(
+                  folder + ".meta"
+              )
+
+          # --------------------------------------------------------
+          # Include existing .meta files from the source content.
+          # --------------------------------------------------------
+
+          search_root = os.path.join(
+              "PackageStaging",
+              import_path
+          )
+
+          for root, _, files in os.walk(search_root):
+              for filename in files:
+                  if not filename.endswith(".meta"):
+                      continue
+
+                  absolute_path = os.path.join(
+                      root,
+                      filename
+                  )
+
+                  relative_path = os.path.relpath(
+                      absolute_path,
+                      "PackageStaging"
+                  )
+
+                  relative_path = relative_path.replace(
+                      os.sep,
+                      "/"
+                  )
+
+                  meta_files.add(relative_path)
+
+          # --------------------------------------------------------
+          # Write metaList used by create-unitypackage.
+          # --------------------------------------------------------
+
+          meta_list_path = os.path.join(
+              "PackageStaging",
+              "metaList"
+          )
+
+          sorted_meta_files = sorted(meta_files)
+
+          with open(
+              meta_list_path,
+              "w",
+              newline="\n"
+          ) as output:
+              for path in sorted_meta_files:
+                  output.write(path + "\n")
+
+          print("Files that will be packaged:")
+
+          for path in sorted_meta_files:
+              print(path)
+          PY
+
+      # ------------------------------------------------------------
+      # Prepare destination
+      # ------------------------------------------------------------
+
+      - name: Prepare package output
+        env:
+          OUTPUT_PATH: ${{ inputs.output_path }}
+        run: |
+          mkdir -p "$(dirname "$OUTPUT_PATH")"
+
+          # Delete existing package so it can be replaced.
+          rm -f "$OUTPUT_PATH"
+
+      # ------------------------------------------------------------
+      # Build UnityPackage
+      # ------------------------------------------------------------
+
+      - name: Create UnityPackage
+        uses: pCYSl5EDgo/create-unitypackage@master
+        with:
+          package-path: 'Generated.unitypackage'
+          include-files: metaList
+          working-folder: 'PackageStaging'
+          project-folder: './'
+
+      # ------------------------------------------------------------
+      # Move generated package into caller repository
+      # ------------------------------------------------------------
+
+      - name: Move UnityPackage to output
+        env:
+          OUTPUT_PATH: ${{ inputs.output_path }}
+        run: |
+          GENERATED_PACKAGE='PackageStaging/Generated.unitypackage'
+
+          if [ ! -f "$GENERATED_PACKAGE" ]; then
+            echo "ERROR: UnityPackage was not created."
+            echo
+            echo "Staging contents:"
+
+            find PackageStaging \
+              -maxdepth 10 \
+              -type f \
+              -print
+
+            exit 1
+          fi
+
+          mv \
+            "$GENERATED_PACKAGE" \
+            "$OUTPUT_PATH"
+
+          echo "UnityPackage created successfully:"
+          ls -lh "$OUTPUT_PATH"
+
+      # ------------------------------------------------------------
+      # Commit generated package back to caller repository
+      # ------------------------------------------------------------
+
+      - name: Commit UnityPackage
+        env:
+          OUTPUT_PATH: ${{ inputs.output_path }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f -- "$OUTPUT_PATH"
+
+          if git diff --cached --quiet; then
+            echo "UnityPackage has not changed."
+            exit 0
+          fi
+
+          PACKAGE_NAME="$(basename "$OUTPUT_PATH")"
+
+          git commit \
+            -m "Build $PACKAGE_NAME"
+
+          git push \
+            origin \
+            "HEAD:$TARGET_BRANCH"
