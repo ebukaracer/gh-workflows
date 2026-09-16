@@ -1,0 +1,110 @@
+name: Tag Repository from package.json
+
+on:
+  workflow_call:
+    inputs:
+      package_json:
+        description: 'Path to package.json'
+        required: false
+        type: string
+        default: 'src/package.json'
+
+      tag_prefix:
+        description: 'Prefix added to the package version'
+        required: false
+        type: string
+        default: 'v'
+
+      dry_run:
+        description: 'If true, show the tag without creating it'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Read version from package.json
+        id: version
+        env:
+          PACKAGE_JSON: ${{ inputs.package_json }}
+        run: |
+          if [ ! -f "$PACKAGE_JSON" ]; then
+            echo "ERROR: package.json not found:"
+            echo "$PACKAGE_JSON"
+            exit 1
+          fi
+
+          VERSION=$(jq -r '.version' "$PACKAGE_JSON")
+
+          if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
+            echo "ERROR: package.json version not found." >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare tag
+        id: prep
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          TAG="${TAG_PREFIX}${VERSION}"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Version: $VERSION"
+          echo "Tag: $TAG"
+
+      - name: Get triggering commit message
+        id: commit
+        run: |
+          set -eu
+
+          COMMIT_SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
+
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+          COMMIT_MSG=$(git show -s --format=%B "$COMMIT_SHA" || true)
+
+          {
+            echo "commit_msg<<EOF"
+            printf '%s\n' "$COMMIT_MSG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        env:
+          TAG: ${{ steps.prep.outputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          COMMIT_MSG: ${{ steps.commit.outputs.commit_msg }}
+        run: |
+          echo "Tag: $TAG"
+          echo "Dry run: $DRY_RUN"
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists. Skipping."
+            exit 0
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run enabled."
+            echo "Would create annotated tag: $TAG"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$TAG" -m "$COMMIT_MSG"
+
+          git push origin "$TAG"

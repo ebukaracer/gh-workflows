@@ -1,0 +1,93 @@
+name: Deploy Directory to Branch
+
+on:
+  workflow_call:
+    inputs:
+      source_path:
+        description: 'Directory whose contents should be deployed'
+        required: true
+        type: string
+
+      target_branch:
+        description: 'Branch receiving the deployed files'
+        required: false
+        type: string
+        default: 'upm'
+
+      commit_message:
+        description: 'Commit message used on the target branch'
+        required: false
+        type: string
+        default: 'Deploy latest files'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate source
+        env:
+          SOURCE_PATH: ${{ inputs.source_path }}
+        run: |
+          if [ ! -d "$SOURCE_PATH" ]; then
+            echo "ERROR: Source directory not found:"
+            echo "$SOURCE_PATH"
+            exit 1
+          fi
+
+      - name: Prepare deployment files
+        env:
+          SOURCE_PATH: ${{ inputs.source_path }}
+        run: |
+          rm -rf "$RUNNER_TEMP/deploy-content"
+          mkdir -p "$RUNNER_TEMP/deploy-content"
+
+          cp -a "$SOURCE_PATH"/. "$RUNNER_TEMP/deploy-content/"
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create target branch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          git checkout --orphan "$TARGET_BRANCH"
+          git rm -rf . || true
+
+          # Remove anything left behind that isn't part of .git.
+          find . \
+            -mindepth 1 \
+            -maxdepth 1 \
+            ! -name '.git' \
+            -exec rm -rf {} +
+
+      - name: Copy deployment files
+        run: |
+          cp -a "$RUNNER_TEMP/deploy-content"/. .
+
+      - name: Commit and push
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          COMMIT_MESSAGE: ${{ inputs.commit_message }}
+        run: |
+          git add --all
+
+          if git diff --cached --quiet; then
+            echo "No files to deploy."
+            exit 0
+          fi
+
+          git commit -m "$COMMIT_MESSAGE"
+
+          git push \
+            origin \
+            "$TARGET_BRANCH" \
+            --force
