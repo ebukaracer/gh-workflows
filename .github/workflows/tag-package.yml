@@ -1,4 +1,4 @@
-name: Tag Repository from package.json
+name: Tag repository from package.json
 
 on:
   workflow_call:
@@ -9,14 +9,20 @@ on:
         type: string
         default: 'src/package.json'
 
+      target_branch:
+        description: 'Branch containing package.json and commit to tag'
+        required: false
+        type: string
+        default: ''
+
       tag_prefix:
-        description: 'Prefix added to the package version'
+        description: 'Prefix for the tag'
         required: false
         type: string
         default: 'v'
 
       dry_run:
-        description: 'If true, show the tag without creating it'
+        description: 'If true, do not create or push the tag'
         required: false
         type: boolean
         default: false
@@ -26,10 +32,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ------------------------------------------------------------
+      # Checkout branch containing package.json
+      # ------------------------------------------------------------
+
       - name: Checkout
         uses: actions/checkout@v5
         with:
+          ref: ${{ inputs.target_branch || github.ref_name }}
           fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # Read version
+      # ------------------------------------------------------------
 
       - name: Read version from package.json
         id: version
@@ -45,11 +60,16 @@ jobs:
           VERSION=$(jq -r '.version' "$PACKAGE_JSON")
 
           if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
-            echo "ERROR: package.json version not found." >&2
+            echo "ERROR: package.json version not found."
             exit 1
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VERSION"
+
+      # ------------------------------------------------------------
+      # Prepare tag
+      # ------------------------------------------------------------
 
       - name: Prepare tag
         id: prep
@@ -60,26 +80,36 @@ jobs:
           TAG="${TAG_PREFIX}${VERSION}"
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-          echo "Version: $VERSION"
           echo "Tag: $TAG"
 
-      - name: Get triggering commit message
+      # ------------------------------------------------------------
+      # Read commit being tagged
+      #
+      # This deliberately uses HEAD instead of GITHUB_SHA because
+      # target_branch may be different from the branch that
+      # originally triggered the caller workflow.
+      # ------------------------------------------------------------
+
+      - name: Get target commit
         id: commit
         run: |
-          set -eu
-
-          COMMIT_SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
+          COMMIT_SHA=$(git rev-parse HEAD)
+          COMMIT_MSG=$(git log -1 --pretty=%B HEAD)
 
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
-
-          COMMIT_MSG=$(git show -s --format=%B "$COMMIT_SHA" || true)
 
           {
             echo "commit_msg<<EOF"
             printf '%s\n' "$COMMIT_MSG"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+
+          echo "Commit being tagged:"
+          echo "$COMMIT_SHA"
+
+      # ------------------------------------------------------------
+      # Create tag
+      # ------------------------------------------------------------
 
       - name: Create tag
         env:
@@ -90,14 +120,22 @@ jobs:
           echo "Tag: $TAG"
           echo "Dry run: $DRY_RUN"
 
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+          # Fetch tags first in case another workflow created one.
+          git fetch origin --tags
+
+          if git rev-parse \
+            -q \
+            --verify \
+            "refs/tags/$TAG" \
+            >/dev/null; then
+
             echo "Tag $TAG already exists. Skipping."
             exit 0
           fi
 
           if [ "$DRY_RUN" = "true" ]; then
             echo "Dry run enabled."
-            echo "Would create annotated tag: $TAG"
+            echo "Would create tag: $TAG"
             exit 0
           fi
 
@@ -105,6 +143,10 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git tag -a "$TAG" -m "$COMMIT_MSG"
+          git tag \
+            -a "$TAG" \
+            -m "$COMMIT_MSG"
 
           git push origin "$TAG"
+
+          echo "Created tag: $TAG"
